@@ -41,7 +41,7 @@ def make_parser():
     )
     parser.add_argument("-b", "--batch-size", type=int, default=64, help="batch size")
     parser.add_argument(
-        "-d", "--devices", default=None, type=int, help="device for training"
+        "-d", "--devices", default=1, type=int, help="device for training"
     )
     parser.add_argument(
         "--num_machines", default=1, type=int, help="num of node for training"
@@ -137,9 +137,6 @@ def make_parser():
     return parser
 
 def setup_distributed_hpu():
-    #TBD : get seed from command line
-    input_shape_seed = int(time.time())
-
     from habana_frameworks.torch.distributed.hccl import initialize_distributed_hpu
 
     world_size, global_rank, local_rank = initialize_distributed_hpu()
@@ -149,12 +146,23 @@ def setup_distributed_hpu():
     dist._DEFAULT_FIRST_BUCKET_BYTES = 200*1024*1024  # 200MB
     dist.init_process_group('hccl', rank=global_rank, world_size=world_size)
 
-    random.seed(input_shape_seed)
     # torch.set_num_interop_threads(7)
     # torch.set_num_threads(7)
 
+def set_seed(exp, args):
+    seed = int(time.time())
+    seed = exp.seed if exp.seed is None else seed
+    seed = args.seed if args.seed is None else seed
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
 @logger.catch
 def main(exp, args):
+    set_seed(exp, args)
+
     is_distributed = False
     if args.hpu: # Load Habana SW modules
         device = torch.device("hpu")
@@ -166,23 +174,13 @@ def main(exp, args):
     exp.data_dir = args.data_dir
     exp.data_num_workers = args.data_num_workers
 
-    if exp.seed is not None:
-        random.seed(exp.seed)
-        np.random.seed(exp.seed)
-        torch.manual_seed(exp.seed)
-        warnings.warn(
-            "You have chosen to seed training. This will turn on the CUDNN deterministic setting, "
-            "which can slow down your training considerably! You may see unexpected behavior "
-            "when restarting from checkpoints."
-        )
-
     rank = get_local_rank()
 
-    file_name = os.path.join(exp.output_dir, args.experiment_name)
+    log_file_name = os.path.join(exp.output_dir, args.experiment_name)
     if rank == 0:
-        os.makedirs(file_name, exist_ok=True)
+        os.makedirs(log_file_name, exist_ok=True)
 
-    setup_logger(file_name, distributed_rank=rank, filename="val_log.txt", mode="a")
+    setup_logger(log_file_name, distributed_rank=rank, filename="val_log.txt", mode="a")
 
     logger.info("Args: {}".format(args))
 
@@ -196,24 +194,28 @@ def main(exp, args):
     # model creation
     model = exp.get_model(args.hpu)
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
-    logger.info("Model Structure:\n{}".format(str(model)))
+    # logger.info("Model Structure:\n{}".format(str(model)))
     if not args.speed:
         if args.ckpt is None:
-            ckpt_file = os.path.join(file_name, "best_ckpt.pth")
+            ckpt_file = os.path.join(log_file_name, "best_ckpt.pth")
         else:
             ckpt_file = args.ckpt
         logger.info("loading checkpoint from {}".format(ckpt_file))
         ckpt = torch.load(ckpt_file, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
+
     model.to(device)
+
     if args.fuse:
         logger.info("\tFusing model...")
         with torch.no_grad():
             model = fuse_model(model)
+
     if is_distributed:
         logger.info("\tDistributing model...")
         model = DDP(model, broadcast_buffers=False)
+
     model.eval()
 
     evaluator = exp.get_evaluator(args.batch_size, is_distributed,

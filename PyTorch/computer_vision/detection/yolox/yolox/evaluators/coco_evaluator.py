@@ -19,6 +19,8 @@ import numpy as np
 
 import torch
 
+import habana_frameworks.torch.core as htcore
+
 from yolox.data.datasets import COCO_CLASSES
 from yolox.utils import (
     gather,
@@ -122,10 +124,13 @@ class COCOEvaluator:
         self.warmup_steps = warmup_steps
 
         self.post_proc_device = None
+        if self.use_hpu:
+            self.post_proc_device = "hpu"
         if self.cpu_post_processing:
             self.post_proc_device = "cpu"
-        elif self.use_hpu:
-            self.post_proc_device = "hpu"
+        if self.post_proc_device is None:
+            raise RuntimeError("Device for post-processing is not defined. "
+                               "Please, use `--cpu-post-processing` and your device should be `hpu`.")
 
         self.postprocessor = Postprocessor(
                                     self.num_classes,
@@ -173,7 +178,9 @@ class COCOEvaluator:
 
         inference_time = 0
         nms_time = 0
-        num_full_batch_steps = len(self.dataloader) - 1
+        num_full_batch_steps = len(self.dataloader)
+        if len(self.dataloader.dataset) % self.dataloader.batch_size:
+            num_full_batch_steps -= 1
         n_samples = max(num_full_batch_steps - self.warmup_steps, 1)
 
         if trt_file is not None: # ignore this on cpu or hpu
@@ -197,8 +204,8 @@ class COCOEvaluator:
                     imgs = imgs.type(tensor_type)
 
                 # skip the the last iters since batchsize might be not enough for batch inference
-                is_time_record = self.warmup_steps <= cur_iter < num_full_batch_steps
-                if is_time_record:
+                need_time_record = self.warmup_steps <= cur_iter < num_full_batch_steps
+                if need_time_record:
                     start = time.time()
 
                 outputs = model(imgs)
@@ -209,13 +216,13 @@ class COCOEvaluator:
                     htcore.mark_step()
                     outputs = outputs.to('cpu')
 
-                if is_time_record:
+                if need_time_record:
                     infer_end = time_synchronized()
                     inference_time += infer_end - start
 
                 outputs = self.postprocessor(outputs)
 
-                if is_time_record:
+                if need_time_record:
                     nms_end = time_synchronized()
                     nms_time += nms_end - infer_end
 
@@ -224,26 +231,24 @@ class COCOEvaluator:
         last_finish = time_synchronized()
 
         if torch.cuda.is_available():
-            statistics = torch.cuda.FloatTensor([inference_time, nms_time, n_samples])
-            first_start = torch.cuda.DoubleTensor([first_start])
-            last_finish = torch.cuda.DoubleTensor([last_finish])
-
+            statistics = torch.cuda.DoubleTensor([inference_time, nms_time, n_samples,
+                                                  first_start, last_finish])
         else:
-            statistics = torch.FloatTensor([inference_time, nms_time, n_samples])
-            first_start = torch.DoubleTensor([first_start], device='cpu')
-            last_finish = torch.DoubleTensor([last_finish], device='cpu')
+            statistics = torch.DoubleTensor([inference_time, nms_time, n_samples,
+                                             first_start, last_finish])
 
         if distributed:
             data_list = gather(data_list, dst=0)
             data_list = list(itertools.chain(*data_list))
-            torch.distributed.reduce(statistics, dst=0,
-                                        group=torch.distributed.new_group(backend="gloo"))
-            torch.distributed.reduce(first_start, dst=0, op=torch.distributed.ReduceOp.MIN,
-                                        group=torch.distributed.new_group(backend="gloo"))
-            torch.distributed.reduce(last_finish, dst=0, op=torch.distributed.ReduceOp.MAX,
-                                        group=torch.distributed.new_group(backend="gloo"))
-
-        statistics = torch.cat((statistics, last_finish - first_start), dim=-1)
+            reduce_group = torch.distributed.new_group(backend="gloo")
+            torch.distributed.reduce(statistics[:-2], dst=0,
+                                        group=reduce_group)
+            torch.distributed.reduce(statistics[-2], dst=0,
+                                        op=torch.distributed.ReduceOp.MIN,
+                                        group=reduce_group)
+            torch.distributed.reduce(statistics[-1], dst=0,
+                                        op=torch.distributed.ReduceOp.MAX,
+                                        group=reduce_group)
 
         eval_results = self.evaluate_prediction(data_list, statistics)
 
@@ -292,7 +297,7 @@ class COCOEvaluator:
         inference_time = statistics[0].item()
         nms_time = statistics[1].item()
         n_samples = statistics[2].item()
-        total_time = statistics[3].item()
+        total_time = statistics[4].item() - statistics[3].item()
         # total_samles and total_samples_recorded can be different
         # due to warmup_steps and not counted last iteration
         total_samles = len(self.dataloader)
