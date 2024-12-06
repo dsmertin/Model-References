@@ -149,13 +149,13 @@ curl -L -O https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1
 **Run validation on 1 HPU:**
 * FP32 data type:
     ```bash
-    $PYTHON tools/eval.py -n yolox-s -c path/to/yolox_s.pth --data_dir path/to/data/COCO -b 256 -d 1 --conf 0.001 --data_num_workers 4 --hpu --fuse --cpu-post-processing --warmup_steps 4
+    $PYTHON tools/eval.py --name yolox-s --ckpt ./yolox_s.pth --data_dir /data/COCO --batch-size 256 --devices 1 --conf 0.001 --data_num_workers 4 --hpu --fuse --cpu-post-processing --warmup_steps 4
     ```
 
 * BF16 data type:
     ```bash
     PT_HPU_AUTOCAST_LOWER_PRECISION_OPS_LIST=ops_bf16_yolox.txt PT_HPU_AUTOCAST_FP32_OPS_LIST=ops_fp32_yolox.txt \
-    $PYTHON tools/eval.py -n yolox-s -c path/to/yolox_s.pth --data_dir path/to/data/COCO -b 256 -d 1 --conf 0.001 --hpu --autocast --fuse --cpu-post-processing --warmup_steps 4
+    $PYTHON tools/eval.py --name yolox-s --ckpt ./yolox_s.pth --data_dir /data/COCO --batch-size 256 --devices 1 --conf 0.001 --hpu --autocast --fuse --cpu-post-processing --warmup_steps 4
     ```
 
 **Run validation on 2 HPUs:**
@@ -167,7 +167,7 @@ curl -L -O https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1
     export MASTER_ADDR=localhost
     export MASTER_PORT=12355
     mpirun -n 2 --bind-to core --map-by socket:PE=6 --rank-by core --report-bindings --allow-run-as-root \
-    $PYTHON tools/eval.py -n yolox-s -c path/to/yolox_s.pth --data_dir path/to/data/COCO -b 1024 -d 2 --conf 0.001 --hpu --fuse --cpu-post-processing --warmup_steps 2
+    $PYTHON tools/eval.py --name yolox-s --ckpt ./yolox_s.pth --data_dir /data/COCO --batch-size 1024 --devices 2 --conf 0.001 --hpu --fuse --cpu-post-processing --warmup_steps 2
     ```
 
 * BF16 data type:
@@ -176,7 +176,7 @@ curl -L -O https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1
     export MASTER_PORT=12355
     PT_HPU_AUTOCAST_LOWER_PRECISION_OPS_LIST=ops_bf16_yolox.txt PT_HPU_AUTOCAST_FP32_OPS_LIST=ops_fp32_yolox.txt \
     mpirun -n 2 --bind-to core --map-by socket:PE=6 --rank-by core --report-bindings --allow-run-as-root \
-    $PYTHON tools/eval.py -n yolox-s -c path/to/yolox_s.pth --data_dir path/to/data/COCO -b 1024 -d 2 --conf 0.001 --hpu --autocast --fuse --cpu-post-processing --warmup_steps 2
+    $PYTHON tools/eval.py --name yolox-s --ckpt ./yolox_s.pth --data_dir /data/COCO --batch-size 1024 --devices 2 --conf 0.001 --hpu --autocast --fuse --cpu-post-processing --warmup_steps 2
     ```
 
 # Supported Configurations
