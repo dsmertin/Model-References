@@ -89,7 +89,6 @@ Alternatively, you can pass the COCO dataset location to the `--data_dir` argume
 
 ## Training Examples
 ### Run Single Card and Multi-Card Training Examples
-**NOTE:** YOLOX only supports Lazy mode.
 
 **Run training on 1 HPU:**
 * FP32 data type, train for 500 steps:
@@ -182,9 +181,14 @@ curl -L -O https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1
 # Supported Configurations
 | Device | Intel Gaudi Software Version | PyTorch Version |
 |--------|------------------------------|-----------------|
-| Gaudi  | 1.18.0                       | 2.4.0          |
+| Gaudi  | 1.19.0                       | 2.5.1           |
+| Gaudi 2 | 1.19.0                       | 2.5.1          |
+| Gaudi 3 | 1.19.0                       | 2.5.1          |
 
 ## Changelog
+### 1.19.0
+* Evaluation script was enabled for HPU.
+* Enabled eager mode.
 ### 1.12.0
 * Removed PT_HPU_LAZY_MODE environment variable.
 * Removed flag use_lazy_mode.
@@ -208,6 +212,3 @@ The following are the changes made to the training scripts:
    * Enabled distributed training with HCCL backend on 8 HPUs.
 
    * mark_step() is called to trigger execution.
-
-## Known Issues
-Eager mode is not supported.

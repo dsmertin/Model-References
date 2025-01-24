@@ -19,15 +19,12 @@ import numpy as np
 
 import torch
 
-import habana_frameworks.torch.core as htcore
-
 from yolox.data.datasets import COCO_CLASSES
 from yolox.utils import (
     gather,
     is_main_process,
     Postprocessor,
     synchronize,
-    time_synchronized,
     xyxy2xywh
 )
 
@@ -172,16 +169,13 @@ class COCOEvaluator:
         model = model.eval()
         if half:
             model = model.half()
-        ids = []
-        data_list = []
+
         progress_bar = tqdm if is_main_process() else iter
 
+        data_for_evaluation = []
         inference_time = 0
         nms_time = 0
-        num_full_batch_steps = len(self.dataloader)
-        if len(self.dataloader.dataset) % self.dataloader.batch_size:
-            num_full_batch_steps -= 1
-        n_samples = max(num_full_batch_steps - self.warmup_steps, 1)
+        interence_time_recorded_steps = 0
 
         if trt_file is not None: # ignore this on cpu or hpu
             from torch2trt import TRTModule
@@ -193,7 +187,7 @@ class COCOEvaluator:
             model(x)
             model = model_trt
 
-        first_start = time.time()
+        loop_start = time.time()
         for cur_iter, (imgs, _, info_imgs, ids) in enumerate(
             progress_bar(self.dataloader)
         ):
@@ -204,51 +198,57 @@ class COCOEvaluator:
                     imgs = imgs.type(tensor_type)
 
                 # skip the the last iters since batchsize might be not enough for batch inference
-                need_time_record = self.warmup_steps <= cur_iter < num_full_batch_steps
+                is_batch_size_full = imgs.size(0) == self.dataloader.batch_size
+                need_time_record = self.warmup_steps <= cur_iter and is_batch_size_full
                 if need_time_record:
-                    start = time.time()
+                    interence_time_recorded_steps += 1
+                    infer_start = time.time()
 
                 outputs = model(imgs)
                 if decoder is not None:
                     outputs = decoder(outputs, dtype=outputs.type())
 
                 if self.cpu_post_processing:
-                    htcore.mark_step()
                     outputs = outputs.to('cpu')
-
-                if need_time_record:
-                    infer_end = time_synchronized()
-                    inference_time += infer_end - start
 
                 outputs = self.postprocessor(outputs)
 
                 if need_time_record:
-                    nms_end = time_synchronized()
-                    nms_time += nms_end - infer_end
+                    inference_time += time.time() - infer_start
 
+            data_for_evaluation.append((outputs, info_imgs, ids))
+
+        total_time = time.time() - loop_start
+        if interence_time_recorded_steps < 1:
+            logger.warning(
+                "Not enough steps have been performed to calculate the inference performance metrics."
+                )
+
+        data_list = []
+        for outputs, info_imgs, ids in data_for_evaluation:
             data_list.extend(self.convert_to_coco_format(outputs, info_imgs, ids))
-
-        last_finish = time_synchronized()
-
-        if torch.cuda.is_available():
-            statistics = torch.cuda.DoubleTensor([inference_time, nms_time, n_samples,
-                                                  first_start, last_finish])
-        else:
-            statistics = torch.DoubleTensor([inference_time, nms_time, n_samples,
-                                             first_start, last_finish])
 
         if distributed:
             data_list = gather(data_list, dst=0)
             data_list = list(itertools.chain(*data_list))
-            reduce_group = torch.distributed.new_group(backend="gloo")
-            torch.distributed.reduce(statistics[:-2], dst=0,
-                                        group=reduce_group)
-            torch.distributed.reduce(statistics[-2], dst=0,
-                                        op=torch.distributed.ReduceOp.MIN,
-                                        group=reduce_group)
-            torch.distributed.reduce(statistics[-1], dst=0,
-                                        op=torch.distributed.ReduceOp.MAX,
-                                        group=reduce_group)
+
+            gloo_group = torch.distributed.new_group(backend="gloo")
+
+            inference_time_list = gather(inference_time, dst=0, group=gloo_group)
+            total_time_list = gather(total_time, dst=0, group=gloo_group)
+            interence_time_recorded_steps_list = gather(interence_time_recorded_steps, dst=0, group=gloo_group)
+
+            statistics = {
+                'inference_time': inference_time_list,
+                'interence_time_recorded_steps': interence_time_recorded_steps_list,
+                'total_time': total_time_list
+            }
+        else:
+            statistics = {
+                'inference_time': [inference_time],
+                'interence_time_recorded_steps': [interence_time_recorded_steps],
+                'total_time': [total_time]
+            }
 
         eval_results = self.evaluate_prediction(data_list, statistics)
 
@@ -260,7 +260,7 @@ class COCOEvaluator:
         for (output, img_h, img_w, img_id) in zip(
             outputs, info_imgs[0], info_imgs[1], ids
         ):
-            if output.size(0) == 0:
+            if output is None or output.size(0) == 0:
                 continue
             output = output.cpu()
             bboxes = output[:, 0:4]
@@ -294,43 +294,33 @@ class COCOEvaluator:
 
         annType = ["segm", "bbox", "keypoints"]
 
-        inference_time = statistics[0].item()
-        nms_time = statistics[1].item()
-        n_samples = statistics[2].item()
-        total_time = statistics[4].item() - statistics[3].item()
-        # total_samles and total_samples_recorded can be different
-        # due to warmup_steps and not counted last iteration
-        total_samles = len(self.dataloader)
-        total_samples_recorded = n_samples * self.dataloader.batch_size
-        total_throughput = total_samles / total_time
+        inference_time_list = statistics['inference_time']
+        interence_time_recorded_steps_list = statistics['interence_time_recorded_steps']
+        
+        total_time = np.average(statistics['total_time'])
+        total_throughput = len(self.dataloader.dataset) / total_time
 
         time_info = f"Total evaluation loop time: {total_time:.2f} (s)" + \
-                    f"\nTotal throughput: {total_throughput:.2f} (images/s)"
-        if inference_time and nms_time:
-            a_infer_time = 1000 * inference_time / total_samples_recorded
-            a_nms_time = 1000 * nms_time / total_samples_recorded
-            a_infer_tp = total_samples_recorded / inference_time
-            a_nms_tp = total_samples_recorded / nms_time
-            a_total_tp = total_samples_recorded / (inference_time + nms_time)
+                    f"\nTotal evaluation loop throughput: {total_throughput:.2f} (images/s)"
 
-            time_info += '\n' + "\n".join(
-                [
-                    "Average {} latency: {:.4f} (ms)".format(k, v)
-                    for k, v in zip(
-                        ["inference", "NMS", "(inference + NMS)"],
-                        [a_infer_time, a_nms_time, (a_infer_time + a_nms_time)],
-                    )
-                ]
-            )
-            time_info += '\n' + "\n".join(
-                [
-                    "Average {} throughput: {:.4f} (images/s)".format(k, v)
-                    for k, v in zip(
-                        ["inference", "NMS", "(inference + NMS)"],
-                        [a_infer_tp, a_nms_tp, a_total_tp],
-                    )
-                ]
-            )
+        average_inference_time = []
+        average_inference_tp = []
+        is_inference_recorded = False
+        for inference_time, interence_time_recorded_steps in zip(inference_time_list, interence_time_recorded_steps_list):
+            if interence_time_recorded_steps < 1:
+                continue
+            is_inference_recorded = True
+
+            average_inference_time.append(1000 * inference_time / interence_time_recorded_steps)
+            total_images_recorded = interence_time_recorded_steps * self.dataloader.batch_size
+            average_inference_tp.append(total_images_recorded / inference_time)
+
+        if is_inference_recorded:
+            average_inference_time = np.average(average_inference_time)
+            average_inference_tp = np.average(average_inference_tp)
+
+            time_info += f"\nAverage inference time: {average_inference_time:.2f} (ms)" + \
+                        f"\nAverage inference throughput: {average_inference_tp:.2f} (images/s)"
 
         info = time_info + "\n"
 

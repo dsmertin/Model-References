@@ -72,11 +72,13 @@ class Postprocessor(torch.nn.Module):
         return self.image_indexes
 
     def forward(self, prediction):
-        bboxes = torch.zeros_like(prediction[:, :, :4])
-        bboxes[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
-        bboxes[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
-        bboxes[:, :, 2] = prediction[:, :, 0] + prediction[:, :, 2] / 2
-        bboxes[:, :, 3] = prediction[:, :, 1] + prediction[:, :, 3] / 2
+        bboxes = torch.stack((prediction[:, :, 0], prediction[:, :, 1],
+                           prediction[:, :, 0], prediction[:, :, 1]), dim=-1)
+
+        bboxes[:, :, 0] -= prediction[:, :, 2] / 2
+        bboxes[:, :, 1] -= prediction[:, :, 3] / 2
+        bboxes[:, :, 2] += prediction[:, :, 2] / 2
+        bboxes[:, :, 3] += prediction[:, :, 3] / 2
 
         classifications = prediction[:, :, 5: 5 + self.num_classes]
 
@@ -89,7 +91,7 @@ class Postprocessor(torch.nn.Module):
         indexes = self.get_image_indexes(int(prediction.size(0)),
                                          int(prediction.size(1)))
 
-        mask = confidences.squeeze() >= self.conf_thre
+        mask = confidences.squeeze(dim=-1) >= self.conf_thre
         detections = detections[mask]
         indexes = indexes[mask]
 
@@ -124,25 +126,28 @@ class Postprocessor(torch.nn.Module):
 
 
 def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agnostic=False):
-    box_corner = prediction.new(prediction.shape)
-    box_corner[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
-    box_corner[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
-    box_corner[:, :, 2] = prediction[:, :, 0] + prediction[:, :, 2] / 2
-    box_corner[:, :, 3] = prediction[:, :, 1] + prediction[:, :, 3] / 2
-    prediction[:, :, :4] = box_corner[:, :, :4]
+    bboxes = torch.zeros_like(prediction[:, :, :4])
+    bboxes[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
+    bboxes[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
+    bboxes[:, :, 2] = prediction[:, :, 0] + prediction[:, :, 2] / 2
+    bboxes[:, :, 3] = prediction[:, :, 1] + prediction[:, :, 3] / 2
 
-    output = [None for _ in range(len(prediction))]
-    for i, image_pred in enumerate(prediction):
+    classifications = prediction[:, :, 5: 5 + num_classes]
+
+    class_confidences, classes = torch.max(classifications, -1, keepdim=True)
+
+    confidences = prediction[:, :, 4].unsqueeze(-1) * class_confidences
+    batch_detections = torch.cat((bboxes, confidences, classes), -1)
+
+    output = [None for _ in range(len(batch_detections))]
+    for i, detections in enumerate(batch_detections):
 
         # If none are remaining => process next image
-        if not image_pred.size(0):
+        if not detections.size(0):
             continue
         # Get score and class with highest confidence
-        class_conf, class_pred = torch.max(image_pred[:, 5: 5 + num_classes], 1, keepdim=True)
-
-        conf_mask = (image_pred[:, 4] * class_conf.squeeze() >= conf_thre).squeeze()
+        conf_mask = (detections[:, 4] >= conf_thre).squeeze()
         # Detections ordered as (x1, y1, x2, y2, obj_conf, class_conf, class_pred)
-        detections = torch.cat((image_pred[:, :5], class_conf, class_pred.float()), 1)
         detections = detections[conf_mask]
         if not detections.size(0):
             continue
@@ -150,14 +155,14 @@ def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agn
         if class_agnostic:
             nms_out_index = torchvision.ops.nms(
                 detections[:, :4],
-                detections[:, 4] * detections[:, 5],
+                detections[:, 4],
                 nms_thre,
             )
         else:
             nms_out_index = torchvision.ops.batched_nms(
                 detections[:, :4],
-                detections[:, 4] * detections[:, 5],
-                detections[:, 6],
+                detections[:, 4],
+                detections[:, 5],
                 nms_thre,
             )
 

@@ -8,10 +8,6 @@ import random
 import warnings
 from loguru import logger
 
-WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
-# if world size is greater than 8 we're using more than one machine
-os.environ['MKL_NUM_THREADS'] = str(os.cpu_count() / min(WORLD_SIZE, 8))
-
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
@@ -21,7 +17,7 @@ import numpy as np
 import habana_frameworks.torch.core as htcore
 
 from yolox.exp import get_exp
-from yolox.utils import fuse_model, get_local_rank, get_model_info, setup_logger, adjust_status
+from yolox.utils import fuse_model, get_local_rank, get_model_info, setup_logger
 
 
 def make_parser():
@@ -118,9 +114,8 @@ def make_parser():
     )
     parser.add_argument(
         "--data_num_workers",
-        default=12, type=int,
+        default=4, type=int,
         help="Number of workers for data processing"
-
     )
 
     parser.add_argument(
@@ -136,6 +131,7 @@ def make_parser():
 
     return parser
 
+
 def setup_distributed_hpu():
     from habana_frameworks.torch.distributed.hccl import initialize_distributed_hpu
 
@@ -143,11 +139,8 @@ def setup_distributed_hpu():
     print('| distributed init (rank {}) (world_size {})'.format(
         global_rank, world_size), flush=True)
 
-    dist._DEFAULT_FIRST_BUCKET_BYTES = 200*1024*1024  # 200MB
     dist.init_process_group('hccl', rank=global_rank, world_size=world_size)
 
-    # torch.set_num_interop_threads(7)
-    # torch.set_num_threads(7)
 
 def set_seed(exp, args):
     seed = int(time.time())
@@ -159,11 +152,13 @@ def set_seed(exp, args):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
+
 @logger.catch
 def main(exp, args):
     set_seed(exp, args)
 
     is_distributed = False
+    device=torch.device("cpu")
     if args.hpu: # Load Habana SW modules
         device = torch.device("hpu")
         os.environ["PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES"] = "0"
@@ -194,7 +189,6 @@ def main(exp, args):
     # model creation
     model = exp.get_model(args.hpu)
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
-    # logger.info("Model Structure:\n{}".format(str(model)))
     if not args.speed:
         if args.ckpt is None:
             ckpt_file = os.path.join(log_file_name, "best_ckpt.pth")
@@ -228,8 +222,7 @@ def main(exp, args):
     evaluator.per_class_AR = True
 
     # start evaluate
-    with adjust_status(model, training=False),\
-            torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=args.is_autocast):
+    with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=args.is_autocast):
         *_, summary = exp.eval(
                 model, evaluator, is_distributed
             )
@@ -243,7 +236,6 @@ if __name__ == "__main__":
     exp.merge(args.opts)
 
     if args.hpu:
-        num_gpu = 0 if args.devices is None else args.devices
         args.dist_backend = "hccl"
 
     if not args.experiment_name:
